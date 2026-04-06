@@ -13,6 +13,10 @@ Data:
 
 Usage:
   python train.py --config configs/baseline_tone_nb.yaml
+
+model.type:
+  - multinomial_nb | logistic_regression | random_forest — sklearn Pipeline + TF-IDF
+  - distilbert — Hugging Face Trainer (set optuna.enabled: false); logs HF weights under artifact path model/
 """
 
 from __future__ import annotations
@@ -327,6 +331,182 @@ def _run_optuna(
     return _best_params_to_updates(study.best_params), study
 
 
+def _train_distilbert(
+    cfg: dict[str, Any],
+    X_train: list[str],
+    X_val: list[str],
+    X_test: list[str],
+    y_train: np.ndarray,
+    y_val: np.ndarray,
+    y_test: np.ndarray,
+    class_names: list[str],
+    env_info: dict[str, Any],
+    git_sha: str,
+) -> None:
+    if cfg.get("optuna", {}).get("enabled"):
+        raise ValueError("Optuna is not supported for model.type distilbert; set optuna.enabled: false.")
+
+    import shutil
+
+    import torch
+    from datasets import Dataset
+    from transformers import (
+        AutoModelForSequenceClassification,
+        AutoTokenizer,
+        Trainer,
+        TrainingArguments,
+    )
+
+    d = cfg["data"]
+    seed = int(d["random_seed"])
+    mp = dict(cfg["model"].get("params") or {})
+    model_name = str(mp.get("pretrained_model_name", "distilbert-base-uncased"))
+    max_length = int(mp.get("max_length", 128))
+    num_epochs = float(mp.get("num_epochs", 3.0))
+    batch_size = int(mp.get("batch_size", 8))
+    learning_rate = float(mp.get("learning_rate", 5e-5))
+    weight_decay = float(mp.get("weight_decay", 0.01))
+
+    id2label = {i: n for i, n in enumerate(class_names)}
+    label2id = {n: i for i, n in enumerate(class_names)}
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    def make_hf_dataset(texts: list[str], labels: np.ndarray) -> Dataset:
+        ds = Dataset.from_dict({"text": texts, "label": labels.tolist()})
+
+        def tokenize_fn(examples: dict[str, list]) -> dict[str, list]:
+            enc = tokenizer(
+                examples["text"],
+                truncation=True,
+                max_length=max_length,
+                padding="max_length",
+            )
+            enc["labels"] = examples["label"]
+            return enc
+
+        return ds.map(tokenize_fn, batched=True, remove_columns=["text"])
+
+    ds_train = make_hf_dataset(X_train, y_train)
+    ds_val = make_hf_dataset(X_val, y_val)
+    ds_test = make_hf_dataset(X_test, y_test)
+
+    torch.manual_seed(seed)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_name,
+        num_labels=len(class_names),
+        id2label=id2label,
+        label2id=label2id,
+    )
+
+    train_out = Path("./hf_training_out")
+    train_out.mkdir(parents=True, exist_ok=True)
+    eval_strategy = "epoch" if len(ds_val) > 0 else "no"
+    ta_kwargs: dict[str, Any] = {
+        "output_dir": str(train_out),
+        "num_train_epochs": num_epochs,
+        "per_device_train_batch_size": batch_size,
+        "per_device_eval_batch_size": batch_size,
+        "learning_rate": learning_rate,
+        "weight_decay": weight_decay,
+        "save_strategy": "no",
+        "logging_strategy": "epoch",
+        "report_to": [],
+        "seed": seed,
+        "disable_tqdm": True,
+    }
+    try:
+        training_args = TrainingArguments(eval_strategy=eval_strategy, **ta_kwargs)
+    except TypeError:
+        training_args = TrainingArguments(evaluation_strategy=eval_strategy, **ta_kwargs)
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=ds_train,
+        eval_dataset=ds_val if len(ds_val) > 0 else None,
+    )
+
+    with mlflow.start_run(run_name=cfg.get("run_name")):
+        mlflow.set_tag("dataset", d.get("dataset", "tone_csv"))
+        mlflow.set_tag("label_classes", ",".join(class_names))
+        mlflow.set_tag("features", "distilbert_hf")
+        if d.get("dataset", "tone_csv") == "tone_csv":
+            mlflow.set_tag(
+                "dataset_lineage",
+                "Labeled CSV (text,tone); document production source in dataset_lineage.json",
+            )
+        else:
+            mlflow.set_tag("dataset_lineage", "Ken Lang CMU NewsWeeder; sklearn.datasets.fetch_20newsgroups")
+        mlflow.set_tag("code_version_git_sha", git_sha)
+        if cfg.get("description"):
+            mlflow.set_tag("mlflow.note.content", str(cfg["description"])[:1000])
+        mlflow.log_dict(env_info, "training_environment.json")
+        mlflow.log_params(
+            {
+                "data.test_size": d["test_size"],
+                "data.random_seed": seed,
+                "model.type": cfg["model"]["type"],
+                "env.gpu": env_info.get("gpu", ""),
+                "env.python": env_info["python_version"],
+                "features.note": "TF-IDF block in YAML is unused for distilbert; tokenizer from HF",
+            }
+        )
+        mlflow.log_params({f"model.params.{k}": ("null" if v is None else v) for k, v in mp.items()})
+
+        t0 = time.perf_counter()
+        trainer.train()
+        fit_wall = time.perf_counter() - t0
+
+        pred_out = trainer.predict(ds_test)
+        logits = pred_out.predictions
+        if logits.ndim > 2:
+            logits = logits.squeeze(-1)
+        exp_l = np.exp(logits - np.max(logits, axis=1, keepdims=True))
+        y_proba = exp_l / np.sum(exp_l, axis=1, keepdims=True)
+        y_pred = np.argmax(logits, axis=1).astype(np.int64)
+
+        metrics = _evaluate(y_test, y_pred, y_proba, class_names)
+        n_train = len(X_train)
+        mlflow.log_metrics(metrics)
+        mlflow.log_metrics(
+            {
+                "train_n_samples": float(n_train),
+                "test_n_samples": float(len(X_test)),
+                "fit_wall_seconds": fit_wall,
+                "fit_samples_per_second": n_train / max(fit_wall, 1e-9),
+            }
+        )
+
+        bundle = Path("./hf_model_bundle")
+        if bundle.exists():
+            shutil.rmtree(bundle, ignore_errors=True)
+        bundle.mkdir(parents=True, exist_ok=True)
+        trainer.model.save_pretrained(bundle)
+        tokenizer.save_pretrained(bundle)
+        mlflow.log_artifacts(str(bundle), artifact_path="model")
+        mlflow.log_dict(
+            {
+                "format": "huggingface",
+                "load_with": "AutoModelForSequenceClassification.from_pretrained + AutoTokenizer",
+                "pretrained_model_name": model_name,
+                "label_classes": class_names,
+            },
+            "model/serving_hint.json",
+        )
+
+        lineage_path = Path("dataset_lineage.json")
+        lineage_path.write_text(
+            json.dumps(_lineage_record(cfg, class_names), indent=2),
+            encoding="utf-8",
+        )
+        mlflow.log_artifact(str(lineage_path))
+        lineage_path.unlink(missing_ok=True)
+
+        shutil.rmtree(bundle, ignore_errors=True)
+        shutil.rmtree(train_out, ignore_errors=True)
+
+
 def train(cfg: dict[str, Any]) -> None:
     d = cfg["data"]
     seed = int(d["random_seed"])
@@ -350,6 +530,21 @@ def train(cfg: dict[str, Any]) -> None:
     mlflow.set_experiment(cfg.get("experiment_name", "default"))
     env_info = _training_environment()
     git_sha = _git_sha()
+
+    if cfg["model"]["type"] == "distilbert":
+        _train_distilbert(
+            cfg,
+            X_train,
+            X_val,
+            X_test,
+            y_train,
+            y_val,
+            y_test,
+            class_names,
+            env_info,
+            git_sha,
+        )
+        return
 
     with mlflow.start_run(run_name=cfg.get("run_name")):
         mlflow.set_tag("dataset", d.get("dataset", "tone_csv"))
