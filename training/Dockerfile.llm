@@ -1,0 +1,26 @@
+# LLM LoRA training on CPU (small image: CPU-only PyTorch).
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# CPU wheels (smaller than default CUDA torch)
+RUN pip install --upgrade pip && \
+    pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+COPY requirements-llm.txt .
+RUN pip install -r requirements-llm.txt
+
+COPY train_llm.py .
+COPY configs/ /app/configs/
+COPY data/ /app/data/
+
+ENTRYPOINT ["python", "/app/train_llm.py"]
+CMD ["--config", "/app/configs/llm_generator_small.yaml"]
