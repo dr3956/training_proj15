@@ -17,6 +17,8 @@ Usage:
 model.type:
   - multinomial_nb | logistic_regression | random_forest — sklearn Pipeline + TF-IDF
   - distilbert — Hugging Face Trainer (set optuna.enabled: false); logs HF weights under artifact path model/
+
+Tracking: set MLFLOW_TRACKING_URI to your MLflow server (e.g. http://<host>:5000). On the same host as the server, http://127.0.0.1:5000 is typical.
 """
 
 from __future__ import annotations
@@ -42,7 +44,6 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
-    f1_score,
     log_loss,
     precision_recall_fscore_support,
 )
@@ -86,6 +87,7 @@ def _training_environment() -> dict[str, Any]:
         env["gpu"] = out.strip().replace("\n", "; ")
     except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
         env["gpu"] = "none_detected"
+    env["execution_context"] = "docker" if Path("/.dockerenv").exists() else "bare_metal_or_vm"
     return env
 
 
@@ -342,6 +344,7 @@ def _train_distilbert(
     class_names: list[str],
     env_info: dict[str, Any],
     git_sha: str,
+    config_path: Path | None,
 ) -> None:
     if cfg.get("optuna", {}).get("enabled"):
         raise ValueError("Optuna is not supported for model.type distilbert; set optuna.enabled: false.")
@@ -370,6 +373,7 @@ def _train_distilbert(
     id2label = {i: n for i, n in enumerate(class_names)}
     label2id = {n: i for i, n in enumerate(class_names)}
 
+    print(f"[distilbert] Loading tokenizer: {model_name}", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     def make_hf_dataset(texts: list[str], labels: np.ndarray) -> Dataset:
@@ -387,11 +391,13 @@ def _train_distilbert(
 
         return ds.map(tokenize_fn, batched=True, remove_columns=["text"])
 
+    print("[distilbert] Tokenizing train/val/test...", flush=True)
     ds_train = make_hf_dataset(X_train, y_train)
     ds_val = make_hf_dataset(X_val, y_val)
     ds_test = make_hf_dataset(X_test, y_test)
 
     torch.manual_seed(seed)
+    print("[distilbert] Loading model weights (may download on first run)...", flush=True)
     model = AutoModelForSequenceClassification.from_pretrained(
         model_name,
         num_labels=len(class_names),
@@ -413,7 +419,7 @@ def _train_distilbert(
         "logging_strategy": "epoch",
         "report_to": [],
         "seed": seed,
-        "disable_tqdm": True,
+        "disable_tqdm": False,
     }
     try:
         training_args = TrainingArguments(eval_strategy=eval_strategy, **ta_kwargs)
@@ -427,7 +433,11 @@ def _train_distilbert(
         eval_dataset=ds_val if len(ds_val) > 0 else None,
     )
 
+    print("[distilbert] Opening MLflow run...", flush=True)
     with mlflow.start_run(run_name=cfg.get("run_name")):
+        if config_path is not None:
+            mlflow.set_tag("training.config_path", str(config_path))
+        mlflow.set_tag("hyperparameter_tuning", "none")
         mlflow.set_tag("dataset", d.get("dataset", "tone_csv"))
         mlflow.set_tag("label_classes", ",".join(class_names))
         mlflow.set_tag("features", "distilbert_hf")
@@ -454,6 +464,7 @@ def _train_distilbert(
         )
         mlflow.log_params({f"model.params.{k}": ("null" if v is None else v) for k, v in mp.items()})
 
+        print("[distilbert] Starting Trainer (CPU can take ~1-2 min for 3 epochs on seed data)...", flush=True)
         t0 = time.perf_counter()
         trainer.train()
         fit_wall = time.perf_counter() - t0
@@ -477,6 +488,10 @@ def _train_distilbert(
                 "fit_samples_per_second": n_train / max(fit_wall, 1e-9),
             }
         )
+        if num_epochs > 0:
+            mlflow.log_metric("cost_avg_epoch_wall_seconds", fit_wall / float(num_epochs))
+        # Wall-clock GPU-hours not instrumented; 0.0 on CPU nodes. See training_environment.json for GPU probe.
+        mlflow.log_metric("training_gpu_hours", 0.0)
 
         bundle = Path("./hf_model_bundle")
         if bundle.exists():
@@ -484,6 +499,7 @@ def _train_distilbert(
         bundle.mkdir(parents=True, exist_ok=True)
         trainer.model.save_pretrained(bundle)
         tokenizer.save_pretrained(bundle)
+        print("[distilbert] Uploading model artifacts to MLflow...", flush=True)
         mlflow.log_artifacts(str(bundle), artifact_path="model")
         mlflow.log_dict(
             {
@@ -507,7 +523,7 @@ def _train_distilbert(
         shutil.rmtree(train_out, ignore_errors=True)
 
 
-def train(cfg: dict[str, Any]) -> None:
+def train(cfg: dict[str, Any], config_path: Path | None = None) -> None:
     d = cfg["data"]
     seed = int(d["random_seed"])
 
@@ -543,10 +559,15 @@ def train(cfg: dict[str, Any]) -> None:
             class_names,
             env_info,
             git_sha,
+            config_path,
         )
         return
 
     with mlflow.start_run(run_name=cfg.get("run_name")):
+        if config_path is not None:
+            mlflow.set_tag("training.config_path", str(config_path))
+        tuning = "optuna" if cfg.get("optuna", {}).get("enabled") else "none"
+        mlflow.set_tag("hyperparameter_tuning", tuning)
         mlflow.set_tag("dataset", d.get("dataset", "tone_csv"))
         mlflow.set_tag("label_classes", ",".join(class_names))
         if d.get("dataset", "tone_csv") == "tone_csv":
@@ -630,6 +651,11 @@ def train(cfg: dict[str, Any]) -> None:
             niter = np.max(clf.n_iter_) if hasattr(clf.n_iter_, "__len__") else clf.n_iter_
             mlflow.log_metric("solver_iterations_max", float(niter))
             mlflow.log_metric("time_per_solver_iter_seconds", fit_wall / max(float(niter), 1.0))
+        if isinstance(clf, RandomForestClassifier):
+            ne = int(clf.n_estimators)
+            mlflow.log_metric("time_per_estimator_seconds", fit_wall / max(float(ne), 1.0))
+
+        mlflow.log_metric("training_gpu_hours", 0.0)
 
         mlflow.sklearn.log_model(
             sk_model=pipe,
@@ -659,7 +685,7 @@ def main() -> None:
     uri = os.environ.get("MLFLOW_TRACKING_URI")
     if uri:
         mlflow.set_tracking_uri(uri)
-    train(cfg)
+    train(cfg, config_path=args.config)
 
 
 if __name__ == "__main__":

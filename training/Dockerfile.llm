@@ -1,5 +1,6 @@
 # LLM LoRA training on CPU (small image: CPU-only PyTorch).
 # docker build --build-arg GIT_SHA=$(git rev-parse HEAD) -f training/Dockerfile.llm -t llm-train:proj15 ./training
+# Set MLFLOW_TRACKING_URI like the tone Dockerfile (see DEPLOYMENT.md).
 FROM python:3.11-slim
 
 ARG GIT_SHA=unknown

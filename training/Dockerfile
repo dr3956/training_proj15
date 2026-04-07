@@ -1,4 +1,4 @@
-# Training container for Chameleon: run with MLFLOW_TRACKING_URI pointing at your tracking server.
+# Training image for train.py. Set MLFLOW_TRACKING_URI (e.g. http://127.0.0.1:5000 on-host, or http://<host>:5000 remote).
 # Build with code version for MLflow (fills tag code_version_git_sha):
 #   docker build --build-arg GIT_SHA=$(git rev-parse HEAD) -f training/Dockerfile -t tone-train:proj15 ./training
 FROM python:3.11-slim

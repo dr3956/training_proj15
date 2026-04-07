@@ -10,9 +10,9 @@ Usage:
   pip install torch --index-url https://download.pytorch.org/whl/cpu
   python train_llm.py --config configs/llm_generator_small.yaml
 
-Chameleon:
-  export MLFLOW_TRACKING_URI=http://<ip>:5000
-  docker build -f Dockerfile.llm -t llm-train:projXX .
+Remote tracking:
+  export MLFLOW_TRACKING_URI=http://<host>:5000
+  docker build -f Dockerfile.llm -t llm-train:proj15 ./training
 """
 
 from __future__ import annotations
@@ -72,6 +72,7 @@ def _training_environment() -> dict[str, Any]:
         env["gpu"] = out.strip().replace("\n", "; ")
     except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
         env["gpu"] = "none_detected"
+    env["execution_context"] = "docker" if Path("/.dockerenv").exists() else "bare_metal_or_vm"
     return env
 
 
@@ -141,7 +142,7 @@ def _pick_kwargs(callable_obj: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in kwargs.items() if k in params}
 
 
-def train(cfg: dict[str, Any]) -> None:
+def train(cfg: dict[str, Any], config_path: Path | None = None) -> None:
     base = Path(__file__).resolve().parent
     mcfg = cfg["model"]
     tcfg = cfg["training"]
@@ -249,6 +250,9 @@ def train(cfg: dict[str, Any]) -> None:
     t0 = time.perf_counter()
 
     with mlflow.start_run(run_name=cfg.get("run_name")):
+        if config_path is not None:
+            mlflow.set_tag("training.config_path", str(config_path))
+        mlflow.set_tag("hyperparameter_tuning", "none")
         mlflow.set_tag("script", "train_llm.py")
         mlflow.set_tag("base_model", model_name)
         mlflow.set_tag("code_version_git_sha", git_sha)
@@ -274,6 +278,10 @@ def train(cfg: dict[str, Any]) -> None:
         trainer.train()
         train_wall = time.perf_counter() - t0
         mlflow.log_metric("train_wall_seconds", train_wall)
+        ne = float(tcfg["num_train_epochs"])
+        if ne > 0:
+            mlflow.log_metric("cost_avg_epoch_wall_seconds", train_wall / ne)
+        mlflow.log_metric("training_gpu_hours", 0.0)
 
         if trainer.state.log_history:
             last = trainer.state.log_history[-1]
@@ -304,7 +312,7 @@ def main() -> None:
     uri = os.environ.get("MLFLOW_TRACKING_URI")
     if uri:
         mlflow.set_tracking_uri(uri)
-    train(cfg)
+    train(cfg, config_path=args.config)
 
 
 if __name__ == "__main__":
