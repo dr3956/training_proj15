@@ -31,6 +31,7 @@ import os
 import platform
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -657,11 +658,12 @@ def train(cfg: dict[str, Any], config_path: Path | None = None) -> None:
 
         mlflow.log_metric("training_gpu_hours", 0.0)
 
-        mlflow.sklearn.log_model(
-            sk_model=pipe,
-            artifact_path="model",
-            registered_model_name=None,
-        )
+        # Avoid mlflow.sklearn.log_model → Model.log → logged-models REST API, which older
+        # tracking servers (or mismatched client/server) reject with 404. DistilBERT path
+        # already uses log_artifacts; same artifact layout for sklearn flavor.
+        with tempfile.TemporaryDirectory() as model_dir:
+            mlflow.sklearn.save_model(sk_model=pipe, path=model_dir)
+            mlflow.log_artifacts(model_dir, artifact_path="model")
 
         lineage_path = Path("dataset_lineage.json")
         lineage_path.write_text(
